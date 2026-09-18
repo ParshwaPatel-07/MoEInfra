@@ -1,0 +1,4 @@
+torch==2.13.0
+transformers==5.0.0
+bitsandbytes==0.50.2
+vllm==0.29.0
