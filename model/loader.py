@@ -12,7 +12,7 @@ from typing import Optional
 
 import torch
 
-from model.expert import MixtralExpertLayer
+from model.expert import QuantizedMixtralExpert
 
 
 class ModelLoader:
@@ -140,46 +140,94 @@ class ModelLoader:
             len(set(self._weight_map.values())),
         )
 
-    def load_expert(self, layer_id: int, expert_id: int) -> MixtralExpertLayer:
-        """Construct a :class:`~model.expert.MixtralExpertLayer` for a single expert.
+    def load_expert(
+        self,
+        layer_id: int,
+        expert_id: int,
+    ) -> QuantizedMixtralExpert:
+        """Load and NF4-quantize one Mixtral expert."""
 
-        Slices the relevant weight tensors from the loaded checkpoint and
-        wraps them in a :class:`~model.expert.MixtralExpertLayer` on CPU.
-
-        Args:
-            layer_id: Transformer layer index (0-based).
-            expert_id: Expert index within the layer (0-based).
-
-        Returns:
-            A :class:`~model.expert.MixtralExpertLayer` on CPU, ready to be
-            inserted into the cache.
-
-        Raises:
-            RuntimeError: If :meth:`load` has not been called yet.
-            IndexError: If *layer_id* or *expert_id* is out of range.
-        """
         if not self._is_loaded:
             raise RuntimeError(
                 "Call ModelLoader.load() before requesting individual experts."
             )
+
         if not (0 <= layer_id < self.num_layers):
-            raise IndexError(f"layer_id {layer_id} out of range [0, {self.num_layers})")
+            raise IndexError(
+                f"layer_id {layer_id} out of range [0, {self.num_layers})"
+            )
+
         if not (0 <= expert_id < self.num_experts):
-            raise IndexError(f"expert_id {expert_id} out of range [0, {self.num_experts})")
+            raise IndexError(
+                f"expert_id {expert_id} out of range [0, {self.num_experts})"
+            )
+
+        if self._checkpoint_path is None:
+            raise RuntimeError("Checkpoint path is not initialized.")
+
+        prefix = (
+            f"model.layers.{layer_id}."
+            f"block_sparse_moe.experts.{expert_id}."
+        )
+
+        tensor_names = {
+            "w1": prefix + "w1.weight",
+            "w2": prefix + "w2.weight",
+            "w3": prefix + "w3.weight",
+        }
+
+        # Find the shard containing the expert.
+        try:
+            shards = {
+                self._weight_map[name]
+                for name in tensor_names.values()
+            }
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Expert tensor not found in checkpoint index: {exc}"
+            ) from exc
+
+        if len(shards) != 1:
+            raise RuntimeError(
+                f"Expert tensors span multiple shards: {sorted(shards)}"
+            )
+
+        shard_path = self._checkpoint_path / next(iter(shards))
 
         self._logger.debug(
-            "Loading expert: layer=%d, expert=%d", layer_id, expert_id
+            "Loading expert tensors from %s",
+            shard_path.name,
         )
-        # Real implementation: extract w1/w2/w3 from the checkpoint and assign
-        # them to the layer's Linear modules.
-        expert = MixtralExpertLayer(
-            layer_id=layer_id,
-            expert_id=expert_id,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            logger=self._logger,
+
+        # Read the three BF16 tensors.
+        from safetensors import safe_open
+
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            w1 = f.get_tensor(tensor_names["w1"])
+            w2 = f.get_tensor(tensor_names["w2"])
+            w3 = f.get_tensor(tensor_names["w3"])
+
+        # Construct the real NF4 expert.
+        expert = QuantizedMixtralExpert(
+            w1=w1,
+            w2=w2,
+            w3=w3,
         )
-        return expert.cpu()
+
+        # bnb performs the actual packing/quantization when moved to CUDA.
+        # Move back to CPU afterwards so the returned expert is already
+        # quantized and ready for the CPU cache.
+        expert = expert.cuda()
+        torch.cuda.synchronize()
+        expert = expert.cpu()
+
+        self._logger.debug(
+            "Loaded and NF4-quantized expert: layer=%d, expert=%d",
+            layer_id,
+            expert_id,
+        )
+
+        return expert
 
     def get_expert_size_bytes(self) -> int:
         """Return the estimated on-disk / in-memory size of a single expert.
