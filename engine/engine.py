@@ -15,11 +15,15 @@ import time
 import types
 from typing import Optional
 
+from cache.manager import CacheManager
+from cache.types import EvictionPolicy
+from model.loader import ModelLoader
 import torch
 
 from engine.types import ForwardRequest, ForwardResult, PrefetchPolicy
 from engine.router import ExpertRouter
 from engine.prefetch import PrefetchEngine
+from transfer.scheduler import TransferScheduler
 
 
 class InferenceEngine:
@@ -64,10 +68,39 @@ class InferenceEngine:
         )
 
         # Lazy-initialised subsystems (require stub implementations)
-        self._cache_manager = None
-        self._transfer_scheduler = None
-        self._prefetch_engine = None
-        self._model = None
+       # ── Core subsystems ─────────────────────────────────────────────── #
+
+        self._cache_manager = CacheManager(
+            gpu_slots=cache_cfg.get("gpu_slots", 8),
+            cpu_slots=cache_cfg.get("cpu_slots", 32),
+            policy=EvictionPolicy(cache_cfg.get("eviction_policy", "lru")),
+            logger=self._logger,
+        )
+
+        self._transfer_scheduler = TransferScheduler(
+            cache_manager=self._cache_manager,
+            bandwidth_gbps=transfer_cfg.get("bandwidth_gbps", 8.0),
+            max_concurrent=transfer_cfg.get("max_concurrent_transfers", 4),
+            logger=self._logger,
+        )
+
+        self._prefetch_engine = PrefetchEngine(
+            cache_manager=self._cache_manager,
+            transfer_scheduler=self._transfer_scheduler,
+            policy=PrefetchPolicy.NONE,
+            depth=transfer_cfg.get("prefetch_depth", 2),
+            logger=self._logger,
+        )
+
+        self._model = ModelLoader(
+            model_name=model_cfg.get("name"),
+            num_layers=self._num_layers,
+            num_experts=self._num_experts,
+            hidden_size=model_cfg.get("hidden_size", 4096),
+            intermediate_size=model_cfg.get("intermediate_size", 14336),
+            quantization=model_cfg.get("quantization", "int4"),
+            logger=self._logger,
+        )
 
         self._logger.info(
             "InferenceEngine initialised — model=%s, layers=%d, experts=%d/%d",
