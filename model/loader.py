@@ -62,32 +62,83 @@ class ModelLoader:
 
         self._checkpoint_path: Optional[Path] = None
         self._is_loaded: bool = False
-
+        self._weight_map: dict[str, str] = {}
+        self._checkpoint_path: Optional[Path] = None
     # ------------------------------------------------------------------ #
     # Public API                                                           #
     # ------------------------------------------------------------------ #
 
     def load(self) -> None:
-        """Download and prepare the model checkpoint.
+        """Locate and index the Mixtral safetensors checkpoint.
 
-        For large checkpoints this may trigger a HuggingFace Hub download.
-        After this method returns :meth:`load_expert` can be called.
-
-        Returns:
-            None
-
-        Raises:
-            RuntimeError: If the checkpoint cannot be found or loaded.
+        This does not load model weights into memory. It only discovers the
+        checkpoint and builds a tensor-name -> shard-file mapping so that
+        individual experts can be loaded on demand.
         """
         self._logger.info(
             "Loading model %r with quantization=%s ...",
             self.model_name,
             self.quantization,
         )
-        # Real implementation: call transformers.AutoModelForCausalLM.from_pretrained
-        # with load_in_4bit=True and device_map="cpu" so all experts start on CPU.
+
+        checkpoint_path = Path(self.model_name)
+
+        if not checkpoint_path.exists():
+            raise RuntimeError(
+                f"Checkpoint path does not exist: {checkpoint_path}"
+            )
+
+        if not checkpoint_path.is_dir():
+            raise RuntimeError(
+                f"Checkpoint path is not a directory: {checkpoint_path}"
+            )
+
+        index_path = checkpoint_path / "model.safetensors.index.json"
+
+        if not index_path.exists():
+            raise RuntimeError(
+                f"Safetensors index not found: {index_path}"
+            )
+
+        try:
+            import json
+
+            with index_path.open("r", encoding="utf-8") as f:
+                index = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Failed to read safetensors index: {index_path}"
+            ) from exc
+
+        weight_map = index.get("weight_map")
+
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise RuntimeError(
+                f"Invalid or empty weight_map in {index_path}"
+            )
+
+        # Verify that every referenced shard exists.
+        missing_shards = {
+            shard
+            for shard in weight_map.values()
+            if not (checkpoint_path / shard).exists()
+        }
+
+        if missing_shards:
+            raise RuntimeError(
+                f"Checkpoint index references missing shards: "
+                f"{sorted(missing_shards)}"
+            )
+
+        self._checkpoint_path = checkpoint_path
+        self._weight_map = weight_map
         self._is_loaded = True
-        self._logger.info("Model checkpoint ready.")
+
+        self._logger.info(
+            "Checkpoint indexed: %d tensors across %d shards.",
+            len(self._weight_map),
+            len(set(self._weight_map.values())),
+        )
 
     def load_expert(self, layer_id: int, expert_id: int) -> MixtralExpertLayer:
         """Construct a :class:`~model.expert.MixtralExpertLayer` for a single expert.
