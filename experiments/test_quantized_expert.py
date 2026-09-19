@@ -57,6 +57,7 @@ def quantize_linear(weight: torch.Tensor) -> bnb.nn.Linear4bit:
         bias=False,
         quant_type="nf4",
         compress_statistics=False,
+        compute_dtype=torch.float16,
     )
 
     linear.weight = bnb.nn.Params4bit(
