@@ -40,21 +40,24 @@ class QuantizedMixtralExpert(nn.Module):
                 f"Expected BF16 weights, got {weight.dtype}"
             )
 
-        linear = skip_init(
-            bnb.nn.Linear4bit,
-            input_features=weight.shape[1],
-            output_features=weight.shape[0],
-            bias=False,
-            quant_type="nf4",
-            compress_statistics=False,
-            compute_dtype=torch.float16,
-        )
+        linear = object.__new__(bnb.nn.Linear4bit)
+        torch.nn.Module.__init__(linear)
 
+        linear.in_features = weight.shape[1]
+        linear.out_features = weight.shape[0]
         linear.weight = bnb.nn.Params4bit(
             weight,
             requires_grad=False,
+            compress_statistics=False,
             quant_type="nf4",
+            module=linear,
         )
+        linear.bias = None
+        linear.compute_dtype = torch.float16
+        linear.compute_type_is_set = True
+        linear.quant_state = None
+        linear.quant_storage = torch.uint8
+        linear.support_avx512bf16_for_cpu = False
 
         return linear
 
