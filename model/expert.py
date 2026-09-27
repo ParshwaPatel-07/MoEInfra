@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import bitsandbytes as bnb
-
+from torch.nn.utils import skip_init
 
 class QuantizedMixtralExpert(nn.Module):
     """
@@ -40,7 +40,8 @@ class QuantizedMixtralExpert(nn.Module):
                 f"Expected BF16 weights, got {weight.dtype}"
             )
 
-        linear = bnb.nn.Linear4bit(
+        linear = skip_init(
+            bnb.nn.Linear4bit,
             input_features=weight.shape[1],
             output_features=weight.shape[0],
             bias=False,
