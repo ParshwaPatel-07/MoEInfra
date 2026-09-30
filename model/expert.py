@@ -84,3 +84,89 @@ class QuantizedMixtralExpert(nn.Module):
             layer.weight.numel() * layer.weight.element_size()
             for layer in (self.w1, self.w2, self.w3)
         )
+
+
+    @classmethod
+    def from_prequantized(
+        cls,
+        w1_state: dict[str, torch.Tensor],
+        w2_state: dict[str, torch.Tensor],
+        w3_state: dict[str, torch.Tensor],
+        hidden_size: int,
+        intermediate_size: int,
+    ) -> "QuantizedMixtralExpert":
+        """Construct an expert from already-packed NF4 weights.
+
+        The supplied state dictionaries must contain the tensors produced by
+        bitsandbytes Linear4bit.state_dict().
+        """
+        expert = cls.__new__(cls)
+        nn.Module.__init__(expert)
+
+        expert.w1 = cls._linear_from_prequantized(
+            w1_state,
+            in_features=hidden_size,
+            out_features=intermediate_size,
+        )
+        expert.w2 = cls._linear_from_prequantized(
+            w2_state,
+            in_features=intermediate_size,
+            out_features=hidden_size,
+        )
+        expert.w3 = cls._linear_from_prequantized(
+            w3_state,
+            in_features=hidden_size,
+            out_features=intermediate_size,
+        )
+
+        return expert
+
+    @staticmethod
+    def _linear_from_prequantized(
+        state: dict[str, torch.Tensor],
+        in_features: int,
+        out_features: int,
+    ) -> bnb.nn.Linear4bit:
+        """Reconstruct one Linear4bit from serialized NF4 state."""
+
+        required = {
+            "weight",
+            "weight.absmax",
+            "weight.quant_map",
+            "weight.quant_state.bitsandbytes__nf4",
+        }
+
+        missing = required - state.keys()
+        if missing:
+            raise ValueError(
+                f"Missing prequantized NF4 state tensors: "
+                f"{sorted(missing)}"
+            )
+
+        linear = object.__new__(bnb.nn.Linear4bit)
+        nn.Module.__init__(linear)
+
+        linear.in_features = in_features
+        linear.out_features = out_features
+        linear.bias = None
+        linear.compute_dtype = torch.float16
+        linear.compute_type_is_set = True
+        linear.quant_storage = torch.uint8
+        linear.support_avx512bf16_for_cpu = False
+
+        linear.weight = bnb.nn.Params4bit.from_prequantized(
+            data=state["weight"],
+            quantized_stats={
+                "absmax": state["weight.absmax"],
+                "quant_map": state["weight.quant_map"],
+                "quant_state.bitsandbytes__nf4":
+                    state["weight.quant_state.bitsandbytes__nf4"],
+            },
+            quant_type="nf4",
+            quant_storage=torch.uint8,
+            module=linear,
+        )
+
+        linear.quant_state = linear.weight.quant_state
+
+        return linear
