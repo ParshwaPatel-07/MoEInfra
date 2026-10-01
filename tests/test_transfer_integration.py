@@ -14,6 +14,9 @@ from transfer.types import (
     TransferRequest,
     TransferStatus,
 )
+from model.loader import ModelLoader
+import inspect
+import cache.manager
 
 
 def make_request(
@@ -420,3 +423,207 @@ def test_async_rejects_gpu_to_cpu_request():
 
     with pytest.raises(ValueError):
         scheduler.submit_async(request)
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_real_prequantized_expert_model_loader_to_gpu():
+    store1 = "/kaggle/input/datasets/parshwapatel07/mixtral-8x7b-nf4-experts/experts"
+    store2 = "/kaggle/input/datasets/parshwapatel07/mixtral-8x7b-nf4-experts-part2/experts"
+
+    loader = ModelLoader(
+        model_name="/kaggle/input/models/mistral-ai/mixtral/pytorch/8x7b-instruct-v0.1-hf/1",
+        num_layers=32,
+        num_experts=8,
+        hidden_size=4096,
+        intermediate_size=14336,
+        expert_store_paths=[store1, store2],
+    )
+
+    loader.load()
+
+    cpu_expert = loader.load_expert(0, 0)
+
+    assert cpu_expert.device.type == "cpu"
+
+    cache = CacheManager(
+        gpu_slots=1,
+        cpu_slots=4,
+        policy=EvictionPolicy.LRU,
+    )
+
+    cache.put(
+        layer_id=0,
+        expert_id=0,
+        expert=cpu_expert,
+        device="cpu",
+    )
+
+    scheduler, pool, stream = make_scheduler(cache)
+
+    handle = scheduler.submit_async(
+        make_request(layer_id=0, expert_id=0),
+    )
+
+    assert handle.status == TransferStatus.IN_FLIGHT
+
+    stream.synchronize()
+
+    status = scheduler.poll_async(0, 0)
+
+    assert status == TransferStatus.READY
+
+    gpu_expert = cache.peek_gpu(0, 0)
+
+    assert gpu_expert is not None
+    assert gpu_expert.device.type == "cuda"
+    assert cache.peek_cpu(0, 0) is cpu_expert
+
+    assert pool.active_slots == 0
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_real_prequantized_expert_gpu_eviction_and_reload():
+    store1 = "/kaggle/input/datasets/parshwapatel07/mixtral-8x7b-nf4-experts/experts"
+    store2 = "/kaggle/input/datasets/parshwapatel07/mixtral-8x7b-nf4-experts-part2/experts"
+
+    loader = ModelLoader(
+        model_name="/kaggle/input/models/mistral-ai/mixtral/pytorch/8x7b-instruct-v0.1-hf/1",
+        num_layers=32,
+        num_experts=8,
+        hidden_size=4096,
+        intermediate_size=14336,
+        expert_store_paths=[store1, store2],
+    )
+
+    loader.load()
+
+    cpu_expert = loader.load_expert(0, 0)
+
+    cache = CacheManager(
+        gpu_slots=1,
+        cpu_slots=4,
+        policy=EvictionPolicy.LRU,
+    )
+
+    cache.put(0, 0, cpu_expert, "cpu")
+
+    scheduler, pool, stream = make_scheduler(cache)
+
+    # First CPU → GPU transfer.
+    handle = scheduler.submit_async(
+        make_request(layer_id=0, expert_id=0),
+    )
+
+    assert handle.status == TransferStatus.IN_FLIGHT
+
+    stream.synchronize()
+
+    assert scheduler.poll_async(0, 0) == TransferStatus.READY
+    assert cache.is_gpu_resident(0, 0)
+    assert cache.peek_cpu(0, 0) is cpu_expert
+    gpu_expert = cache.peek_gpu(0, 0)
+    assert gpu_expert is not None
+    assert gpu_expert.device.type == "cuda"
+
+    # GPU eviction must NOT destroy the CPU authoritative copy.
+    print("\n--- BEFORE EVICTION ---")
+    print("GPU keys:", list(cache._gpu_cache.keys()))
+    print("CPU keys:", list(cache._cpu_cache.keys()))
+    print("GPU object:", cache.peek_gpu(0, 0))
+    print("CPU object:", cache.peek_cpu(0, 0))
+
+    evicted = cache.evict("gpu")
+
+    print("\n--- AFTER EVICTION ---")
+    print("GPU keys:", list(cache._gpu_cache.keys()))
+    print("CPU keys:", list(cache._cpu_cache.keys()))
+    print("Evicted:", evicted)
+    print("GPU object:", cache.peek_gpu(0, 0))
+    print("CPU object:", cache.peek_cpu(0, 0))
+
+    assert evicted is not None
+    assert cache.peek_gpu(0, 0) is None
+    assert cache.peek_cpu(0, 0) is cpu_expert
+
+    # Reload the same expert from the surviving CPU cache.
+    handle = scheduler.submit_async(
+        make_request(layer_id=0, expert_id=0, request_id="reload"),
+    )
+
+    assert handle.status == TransferStatus.IN_FLIGHT
+
+    stream.synchronize()
+
+    assert scheduler.poll_async(0, 0) == TransferStatus.READY
+
+    reloaded = cache.peek_gpu(0, 0)
+
+    assert reloaded is not None
+    assert reloaded.device.type == "cuda"
+    assert cache.peek_cpu(0, 0) is cpu_expert
+
+    assert pool.active_slots == 0
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_real_prequantized_expert_reload_timing_and_cpu_persistence():
+    import time
+
+    store1 = "/kaggle/input/datasets/parshwapatel07/mixtral-8x7b-nf4-experts/experts"
+    store2 = "/kaggle/input/datasets/parshwapatel07/mixtral-8x7b-nf4-experts-part2/experts"
+
+    loader = ModelLoader(
+        model_name="/kaggle/input/models/mistral-ai/mixtral/pytorch/8x7b-instruct-v0.1-hf/1",
+        num_layers=32,
+        num_experts=8,
+        hidden_size=4096,
+        intermediate_size=14336,
+        expert_store_paths=[store1, store2],
+    )
+
+    loader.load()
+    cpu_expert = loader.load_expert(0, 0)
+
+    cache = CacheManager(
+        gpu_slots=1,
+        cpu_slots=4,
+        policy=EvictionPolicy.LRU,
+    )
+    cache.put(0, 0, cpu_expert, "cpu")
+
+    scheduler, pool, stream = make_scheduler(cache)
+
+    def transfer_and_time():
+        started = time.perf_counter()
+
+        handle = scheduler.submit_async(
+            make_request(layer_id=0, expert_id=0),
+        )
+        assert handle.status == TransferStatus.IN_FLIGHT
+
+        stream.synchronize()
+
+        assert scheduler.poll_async(0, 0) == TransferStatus.READY
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+        assert cache.is_gpu_resident(0, 0)
+        assert cache.peek_cpu(0, 0) is cpu_expert
+
+        return elapsed_ms
+
+    first_ms = transfer_and_time()
+
+    # Evict only the disposable GPU working copy.
+    evicted = cache.evict("gpu")
+
+    assert evicted is not None
+    assert cache.peek_gpu(0, 0) is None
+    assert cache.peek_cpu(0, 0) is cpu_expert
+
+    second_ms = transfer_and_time()
+
+    print(f"\nFirst CPU→GPU reload:  {first_ms:.3f} ms")
+    print(f"Second CPU→GPU reload: {second_ms:.3f} ms")
+    print(f"CPU authoritative copy: {cache.peek_cpu(0, 0) is cpu_expert}")
+
+    assert cache.peek_cpu(0, 0) is cpu_expert
+    assert cache.is_gpu_resident(0, 0)
+    assert pool.active_slots == 0

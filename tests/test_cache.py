@@ -301,6 +301,29 @@ class TestEvict:
         # evict from CPU tier: device should remain cpu
         assert evicted.device == "cpu"
 
+    def test_evict_gpu_alias_evicts_gpu_tier(self):
+        class FakeExpert:
+            size_bytes = 123
+
+        cache = CacheManager(
+            gpu_slots=1,
+            cpu_slots=1,
+            policy=EvictionPolicy.LRU,
+        )
+
+        cpu_expert = FakeExpert()
+        gpu_expert = FakeExpert()
+
+        cache.put(0, 0, cpu_expert, "cpu")
+        cache.put(0, 0, gpu_expert, "cuda")
+
+        evicted = cache.evict("gpu")
+
+        assert evicted is not None
+        assert evicted.expert is gpu_expert
+        assert cache.peek_gpu(0, 0) is None
+        assert cache.peek_cpu(0, 0) is cpu_expert
+
 
 # ── LRU eviction ordering ─────────────────────────────────────────────────
 

@@ -176,16 +176,19 @@ class CacheManager:
 
     def _cache_for(self, device: str) -> dict[tuple[int, int], CacheEntry]:
         """Return the internal dict for the given device tier."""
-        return self._gpu_cache if device.startswith("cuda") else self._cpu_cache
+        return self._gpu_cache if device.startswith(("cuda", "gpu")) else self._cpu_cache
 
     def _slots_for(self, device: str) -> int:
         """Return the slot limit for the given device tier."""
-        return self.gpu_slots if device.startswith("cuda") else self.cpu_slots
+        return self.gpu_slots if device.startswith(("cuda", "gpu")) else self.cpu_slots
 
     def _arc_for(self, device: str) -> _ArcState:
         """Return the ARC state for the given device tier."""
-        return self._arc_gpu if device.startswith("cuda") else self._arc_cpu
-
+        return self._arc_gpu if device.startswith(("cuda", "gpu")) else self._arc_cpu
+    
+    def _is_gpu_device(self, device: str) -> bool:
+        return device.startswith(("cuda", "gpu"))
+    
     def _touch(self, key: tuple[int, int], entry: CacheEntry) -> None:
         """Update access metadata and ARC lists on a cache hit."""
         entry.last_access = time.monotonic()

@@ -281,3 +281,58 @@ def test_load_expert_from_prequantized_store_stays_on_cpu(tmp_path):
     assert expert.w1.weight.device.type == "cpu"
     assert expert.w2.weight.device.type == "cpu"
     assert expert.w3.weight.device.type == "cpu"
+
+def test_prequantized_expert_cpu_to_gpu_forward(tmp_path):
+    make_checkpoint(tmp_path)
+    store = make_prequantized_expert_store(tmp_path)
+
+    loader = ModelLoader(
+        model_name=str(tmp_path),
+        num_layers=NUM_LAYERS,
+        num_experts=NUM_EXPERTS,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        expert_store_paths=[store],
+    )
+
+    loader.load()
+    expert = loader.load_expert(0, 0)
+
+    assert expert.device.type == "cpu"
+
+    x = torch.randn(2, HIDDEN, dtype=torch.float16)
+
+    gpu_expert = expert.cuda()
+    y = gpu_expert(x.cuda())
+
+    assert gpu_expert.device.type == "cuda"
+    assert y.device.type == "cuda"
+    assert y.shape == (2, HIDDEN)
+    assert torch.isfinite(y).all()
+
+def test_real_prequantized_expert_stores():
+    store1 = "/kaggle/input/datasets/parshwapatel07/mixtral-8x7b-nf4-experts/experts"
+    store2 = "/kaggle/input/datasets/parshwapatel07/mixtral-8x7b-nf4-experts-part2/experts"
+
+    loader = ModelLoader(
+        model_name="/kaggle/input/models/mistral-ai/mixtral/pytorch/8x7b-instruct-v0.1-hf/1",
+        num_layers=32,
+        num_experts=8,
+        hidden_size=4096,
+        intermediate_size=14336,
+        expert_store_paths=[store1, store2],
+    )
+
+    loader.load()
+
+    expert_a = loader.load_expert(0, 0)
+    expert_b = loader.load_expert(26, 3)
+
+    assert expert_a.device.type == "cpu"
+    assert expert_b.device.type == "cpu"
+
+    assert expert_a.w1.weight.device.type == "cpu"
+    assert expert_b.w1.weight.device.type == "cpu"
+
+    print("L0 E0:", expert_a.size_bytes / 1024**2, "MiB")
+    print("L26 E3:", expert_b.size_bytes / 1024**2, "MiB")
