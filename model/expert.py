@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import bitsandbytes as bnb
 from torch.nn.utils import skip_init
+from dataclasses import dataclass
 
 class QuantizedMixtralExpert(nn.Module):
     """
@@ -171,3 +172,71 @@ class QuantizedMixtralExpert(nn.Module):
         linear.quant_state = linear.weight.quant_state
 
         return linear
+
+@dataclass
+class PrequantizedNF4Expert:
+    """
+    CPU-resident representation of an already-quantized NF4 Mixtral expert.
+
+    The tensors are stored exactly as they appear in the persisted
+    safetensors files. No bitsandbytes quantization or reconstruction happens
+    here.
+    """
+
+    w1: dict[str, torch.Tensor]
+    w2: dict[str, torch.Tensor]
+    w3: dict[str, torch.Tensor]
+
+    hidden_size: int
+    intermediate_size: int
+
+    _REQUIRED_KEYS = {
+        "weight",
+        "weight.absmax",
+        "weight.quant_map",
+        "weight.quant_state.bitsandbytes__nf4",
+    }
+
+    @classmethod
+    def from_serialized(
+        cls,
+        w1: dict[str, torch.Tensor],
+        w2: dict[str, torch.Tensor],
+        w3: dict[str, torch.Tensor],
+        hidden_size: int,
+        intermediate_size: int,
+    ) -> "PrequantizedNF4Expert":
+
+        for name, state in (
+            ("w1", w1),
+            ("w2", w2),
+            ("w3", w3),
+        ):
+            missing = cls._REQUIRED_KEYS - state.keys()
+            if missing:
+                raise ValueError(
+                    f"Missing serialized NF4 state for {name}: "
+                    f"{sorted(missing)}"
+                )
+
+        return cls(
+            w1=dict(w1),
+            w2=dict(w2),
+            w3=dict(w3),
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+
+    @property
+    def device(self) -> torch.device:
+        return self.w1["weight"].device
+
+    @property
+    def size_bytes(self) -> int:
+        total = 0
+
+        for state in (self.w1, self.w2, self.w3):
+            for tensor in state.values():
+                total += tensor.numel() * tensor.element_size()
+
+        return total

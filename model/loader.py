@@ -12,7 +12,7 @@ from typing import Optional
 
 import torch
 
-from model.expert import QuantizedMixtralExpert
+from model.expert import (PrequantizedNF4Expert, QuantizedMixtralExpert,)
 from model.types import LayerWeights
 from safetensors import safe_open
 
@@ -336,7 +336,7 @@ class ModelLoader:
                     if key.startswith(prefix)
                 }
 
-            expert = QuantizedMixtralExpert.from_prequantized(
+            expert = PrequantizedNF4Expert.from_serialized(
                 extract("w1."),
                 extract("w2."),
                 extract("w3."),
