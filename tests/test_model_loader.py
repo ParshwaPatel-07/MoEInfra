@@ -5,7 +5,8 @@ from safetensors.torch import save_file
 
 from model.loader import ModelLoader
 from model.types import LayerWeights
-
+import pytest
+from model.expert import QuantizedMixtralExpert
 
 HIDDEN = 8
 INTERMEDIATE = 16
@@ -13,6 +14,35 @@ VOCAB = 12
 NUM_LAYERS = 2
 NUM_EXPERTS = 2
 
+def make_prequantized_expert_store(tmp_path):
+    store = tmp_path / "expert_store"
+    store.mkdir()
+
+    torch.manual_seed(0)
+
+    expert = QuantizedMixtralExpert(
+        torch.randn(INTERMEDIATE, HIDDEN, dtype=torch.bfloat16),
+        torch.randn(HIDDEN, INTERMEDIATE, dtype=torch.bfloat16),
+        torch.randn(INTERMEDIATE, HIDDEN, dtype=torch.bfloat16),
+    )
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required to create a real NF4 test fixture")
+
+    expert = expert.cuda()
+    torch.cuda.synchronize()
+
+    state = {}
+
+    for name, tensor in expert.state_dict().items():
+        state[name] = tensor.cpu()
+
+    save_file(
+        state,
+        str(store / "layer_00_expert_00.safetensors"),
+    )
+
+    return store
 
 def make_checkpoint(tmp_path):
     """Create a tiny Mixtral-like checkpoint."""
@@ -195,3 +225,59 @@ def test_load_layer_rejects_invalid_layer(tmp_path):
         pass
     else:
         raise AssertionError("Expected IndexError")
+
+def test_resolve_expert_path_finds_expert(tmp_path):
+    store1 = tmp_path / "store1"
+    store2 = tmp_path / "store2"
+    store1.mkdir()
+    store2.mkdir()
+
+    expected = store2 / "layer_26_expert_03.safetensors"
+    expected.touch()
+
+    loader = ModelLoader(
+        model_name="test-model",
+        num_layers=32,
+        num_experts=8,
+        hidden_size=4096,
+        intermediate_size=14336,
+        expert_store_paths=[store1, store2],
+    )
+
+    assert loader._resolve_expert_path(26, 3) == expected
+
+
+def test_resolve_expert_path_raises_when_missing(tmp_path):
+    loader = ModelLoader(
+        model_name="test-model",
+        num_layers=32,
+        num_experts=8,
+        hidden_size=4096,
+        intermediate_size=14336,
+        expert_store_paths=[tmp_path],
+    )
+
+    with pytest.raises(FileNotFoundError, match="layer_26_expert_03.safetensors"):
+        loader._resolve_expert_path(26, 3)
+
+def test_load_expert_from_prequantized_store_stays_on_cpu(tmp_path):
+    make_checkpoint(tmp_path)
+    store = make_prequantized_expert_store(tmp_path)
+
+    loader = ModelLoader(
+        model_name=str(tmp_path),
+        num_layers=NUM_LAYERS,
+        num_experts=NUM_EXPERTS,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        expert_store_paths=[store],
+    )
+
+    loader.load()
+
+    expert = loader.load_expert(0, 0)
+
+    assert expert.device.type == "cpu"
+    assert expert.w1.weight.device.type == "cpu"
+    assert expert.w2.weight.device.type == "cpu"
+    assert expert.w3.weight.device.type == "cpu"

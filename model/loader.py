@@ -41,6 +41,7 @@ class ModelLoader:
         intermediate_size: int,
         quantization: str = "int4",
         logger: Optional[logging.Logger] = None,
+        expert_store_paths: Optional[list[str | Path]] = None,
     ) -> None:
         """Initialise the loader.
 
@@ -53,6 +54,7 @@ class ModelLoader:
             quantization: Quantisation scheme to apply when loading
                 (``"int4"`` or ``"int8"``).
             logger: Optional pre-configured logger.
+            expert_store_paths:Optional directories containing pre-quantized NF4 expert files.
         """
         self.model_name: str = model_name
         self.num_layers: int = num_layers
@@ -61,6 +63,7 @@ class ModelLoader:
         self.intermediate_size: int = intermediate_size
         self.quantization: str = quantization
         self._logger: logging.Logger = logger or logging.getLogger(__name__)
+        self._expert_store_paths: list[Path] = [Path(path) for path in (expert_store_paths or [])]
 
         self._checkpoint_path: Optional[Path] = None
         self._is_loaded: bool = False
@@ -280,6 +283,21 @@ class ModelLoader:
 
         return tensors["lm_head.weight"]
 
+    def _resolve_expert_path(self, layer_id: int, expert_id: int) -> Path:
+        """Find the persisted pre-quantized NF4 expert file."""
+        filename = f"layer_{layer_id:02d}_expert_{expert_id:02d}.safetensors"
+
+        for store_path in self._expert_store_paths:
+            expert_path = store_path / filename
+            if expert_path.is_file():
+                return expert_path
+
+        searched = ", ".join(str(path) for path in self._expert_store_paths)
+        raise FileNotFoundError(
+            f"Pre-quantized expert not found: {filename}. "
+            f"Searched stores: {searched}"
+        )
+
     def load_expert(
         self,
         layer_id: int,
@@ -304,6 +322,36 @@ class ModelLoader:
 
         if self._checkpoint_path is None:
             raise RuntimeError("Checkpoint path is not initialized.")
+
+        if self._expert_store_paths:
+            expert_path = self._resolve_expert_path(layer_id, expert_id)
+
+            with safe_open(expert_path, framework="pt", device="cpu") as f:
+                state = {key: f.get_tensor(key) for key in f.keys()}
+
+            def extract(prefix: str) -> dict[str, torch.Tensor]:
+                return {
+                    key[len(prefix):]: value
+                    for key, value in state.items()
+                    if key.startswith(prefix)
+                }
+
+            expert = QuantizedMixtralExpert.from_prequantized(
+                extract("w1."),
+                extract("w2."),
+                extract("w3."),
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+            )
+
+            self._logger.debug(
+                "Loaded pre-quantized NF4 expert L%d E%d from %s",
+                layer_id,
+                expert_id,
+                expert_path,
+            )
+
+            return expert
 
         prefix = (
             f"model.layers.{layer_id}."

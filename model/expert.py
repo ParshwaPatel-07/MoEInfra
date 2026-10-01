@@ -167,6 +167,7 @@ class QuantizedMixtralExpert(nn.Module):
             module=linear,
         )
 
+        linear.weight = linear.weight.cpu()
         linear.quant_state = linear.weight.quant_state
 
         return linear
