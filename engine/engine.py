@@ -11,6 +11,7 @@ offloading layers are in place.
 from __future__ import annotations
 
 import logging
+import os
 import time
 import types
 from typing import Optional
@@ -122,6 +123,16 @@ class InferenceEngine:
         self._attention_mask: Optional[torch.Tensor] = None
         self._next_token_logits: Optional[torch.Tensor] = None
         self._last_logits: Optional[torch.Tensor] = None
+
+        # Diagnostic-only memory tracing. Disabled by default so normal
+        # inference/benchmark runs are unaffected.
+        self._memory_debug_enabled = (
+            os.environ.get("MOEINFRA_MEMORY_DEBUG", "0") == "1"
+        )
+        self._memory_debug_pass = 0
+        self._memory_debug_pass_limit = int(
+            os.environ.get("MOEINFRA_MEMORY_DEBUG_PASSES", "2")
+        )
         self._runtime_initialized = False
 
         # Lazy-initialised subsystems (require stub implementations)
@@ -355,7 +366,9 @@ class InferenceEngine:
             position_ids=position_ids,
         )
 
-        for decoder_layer in self._decoder_layers:
+        pass_id = self._memory_debug_pass
+
+        for layer_id, decoder_layer in enumerate(self._decoder_layers):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -366,7 +379,92 @@ class InferenceEngine:
                 position_embeddings=position_embeddings,
             )
 
+            if (
+                self._memory_debug_enabled
+                and self._device.type == "cuda"
+                and pass_id < self._memory_debug_pass_limit
+            ):
+                self._log_memory_snapshot(
+                    phase=f"pass-{pass_id}",
+                    layer_id=layer_id,
+                )
+
+        self._memory_debug_pass += 1
+
         return hidden_states
+
+    @staticmethod
+    def _tensor_bytes(value) -> int:
+        """Return bytes owned by a tensor-like cache value."""
+        if torch.is_tensor(value):
+            return value.numel() * value.element_size()
+        if isinstance(value, (list, tuple)):
+            return sum(InferenceEngine._tensor_bytes(item) for item in value)
+        return 0
+
+    def _kv_cache_bytes(self) -> int:
+        """Best-effort measurement of the tensors currently held by DynamicCache."""
+        cache = self._kv_cache
+        if cache is None:
+            return 0
+
+        total = 0
+        seen: set[int] = set()
+
+        layers = getattr(cache, "layers", None)
+        if layers is None:
+            layers = []
+
+        for layer in layers:
+            for attr in ("keys", "values", "key_cache", "value_cache"):
+                value = getattr(layer, attr, None)
+                if torch.is_tensor(value):
+                    marker = id(value)
+                    if marker not in seen:
+                        seen.add(marker)
+                        total += self._tensor_bytes(value)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        if torch.is_tensor(item):
+                            marker = id(item)
+                            if marker not in seen:
+                                seen.add(marker)
+                                total += self._tensor_bytes(item)
+
+        return total
+
+    def _log_memory_snapshot(self, *, phase: str, layer_id: int) -> None:
+        """Print CUDA allocator, KV-cache, and expert-cache state."""
+        torch.cuda.synchronize(self._device)
+
+        allocated = torch.cuda.memory_allocated(self._device)
+        reserved = torch.cuda.memory_reserved(self._device)
+        kv_bytes = self._kv_cache_bytes()
+
+        cuda_stats = torch.cuda.memory_stats(self._device)
+        inactive_split = cuda_stats.get(
+            "inactive_split_bytes.all.current", 0
+        )
+
+        cache_stats = self._cache_manager.stats()
+        gpu_expert_bytes = 0
+        gpu_cache = getattr(self._cache_manager, "_gpu_cache", {})
+        for entry in gpu_cache.values():
+            gpu_expert_bytes += int(getattr(entry, "size_bytes", 0))
+
+        total = torch.cuda.get_device_properties(self._device).total_memory
+        free = total - allocated
+
+        print(
+            f"[MEM] {phase} layer={layer_id:02d} "
+            f"alloc={allocated / 1024**2:,.1f}MiB "
+            f"reserved={reserved / 1024**2:,.1f}MiB "
+            f"free={free / 1024**2:,.1f}MiB "
+            f"inactive_split={inactive_split / 1024**2:,.1f}MiB "
+            f"kv={kv_bytes / 1024**2:,.2f}MiB "
+            f"gpu_expert={gpu_expert_bytes / 1024**2:,.1f}MiB "
+            f"gpu_slots={cache_stats.gpu_slots_used}"
+        )
 
     def generate(self, request: ForwardRequest) -> ForwardResult:
         """Run the full prefill-then-decode pipeline for *request*."""

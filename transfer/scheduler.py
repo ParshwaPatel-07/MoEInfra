@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import heapq
 import logging
+import os
 import time
 from typing import Optional
 
@@ -86,6 +87,47 @@ class TransferScheduler:
     def _sort_key(request: TransferRequest) -> tuple[int, float]:
         return (request.priority.value, request.issued_at)
 
+    def _memory_debug(self, label: str, request: TransferRequest) -> None:
+        """Log CUDA allocator state at transfer/reconstruction boundaries."""
+        if os.getenv("MOEINFRA_TRANSFER_MEMORY_DEBUG", "0") != "1":
+            return
+        if not torch.cuda.is_available():
+            return
+
+        try:
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated()
+            reserved = torch.cuda.memory_reserved()
+            inactive_split = torch.cuda.memory_stats().get(
+                "inactive_split_bytes.all.current", 0
+            )
+            free, total = torch.cuda.mem_get_info()
+            stats = self._cache_manager.stats()
+            gpu_bytes = 0
+            gpu_cache = getattr(self._cache_manager, "_gpu_cache", None)
+            if gpu_cache is not None:
+                gpu_bytes = sum(
+                    getattr(entry, "size_bytes", 0)
+                    for entry in gpu_cache.values()
+                )
+
+            self._logger.warning(
+                "[TRANSFER_MEM] layer=%d expert=%d step=%s "
+                "alloc=%.1fMiB reserved=%.1fMiB free=%.1fMiB "
+                "inactive_split=%.1fMiB gpu_expert=%.1fMiB gpu_slots=%d",
+                request.layer_id,
+                request.expert_id,
+                label,
+                allocated / 2**20,
+                reserved / 2**20,
+                free / 2**20,
+                inactive_split / 2**20,
+                gpu_bytes / 2**20,
+                stats.gpu_slots_used,
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            self._logger.warning("[TRANSFER_MEM] diagnostic failed: %s", exc)
+
     def submit(self, request: TransferRequest) -> bool:
         """Queue a request unless an equivalent request already exists."""
         if self._is_duplicate(request):
@@ -152,12 +194,15 @@ class TransferScheduler:
                     )
 
                 try:
+                    self._memory_debug("before_stage", request)
+
                     self._staging_pool.stage_expert(
                         slot,
                         cpu_expert,
                         request.layer_id,
                         request.expert_id,
                     )
+                    self._memory_debug("after_stage", request)
 
                     gpu_state = transfer_staged_expert_to_gpu(
                         slot,
@@ -167,18 +212,27 @@ class TransferScheduler:
                     # Synchronous path: wait for the DMA to finish before
                     # reconstructing the GPU expert.
                     self._transfer_stream.synchronize()
+                    self._memory_debug("after_h2d", request)
 
+                    # Important diagnostic boundary: reconstruction currently
+                    # happens BEFORE cache.put() can evict an existing GPU
+                    # expert. This lets us see whether the new expert is being
+                    # allocated while the previous GPU cache is still full.
+                    self._memory_debug("before_reconstruct", request)
                     gpu_expert = ReconstructedNF4Expert(
                         cpu_expert,
                         gpu_state,
                     )
+                    self._memory_debug("after_reconstruct", request)
 
+                    self._memory_debug("before_cache_put", request)
                     self._cache_manager.put(
                         request.layer_id,
                         request.expert_id,
                         gpu_expert,
                         device="cuda:0",
                     )
+                    self._memory_debug("after_cache_put", request)
 
                     success = True
 
