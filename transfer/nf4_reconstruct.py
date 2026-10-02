@@ -107,7 +107,7 @@ def _reconstruct_linear(
         compress_statistics=quant_state.nested,
         quant_type=_NF4_QUANT_TYPE,
         quant_storage=_NF4_QUANT_STORAGE,
-        module=linear,
+        module=None,
         bnb_quantized=True,
     )
 
