@@ -28,17 +28,12 @@ class MoELayer:
         model_loader: ModelLoader,
         transfer_scheduler: TransferScheduler,
         logger: Optional[logging.Logger] = None,
-        expert_chunk_size: int = 2,
     ) -> None:
-        if expert_chunk_size <= 0:
-            raise ValueError("expert_chunk_size must be positive")
-
         self.layer_id = layer_id
         self.router = router
         self.cache_manager = cache_manager
         self.model_loader = model_loader
         self.transfer_scheduler = transfer_scheduler
-        self.expert_chunk_size = expert_chunk_size
         self._logger = logger or logging.getLogger(__name__)
 
     def _ensure_expert_on_gpu(
@@ -124,7 +119,13 @@ class MoELayer:
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        """Run one Mixtral MoE layer."""
+        """Run one Mixtral MoE layer with a full-layer expert working set.
+
+        This is the no-chunk baseline. Routing is computed once for the whole
+        token batch, all unique routed experts for this layer are made resident
+        on GPU, each expert processes all of its assigned tokens exactly once,
+        and experts that were not already GPU-resident are demoted afterward.
+        """
 
         if hidden_states.ndim != 2:
             raise ValueError(
@@ -138,81 +139,74 @@ class MoELayer:
                 f"router hidden size {self.router.hidden_size}"
             )
 
+        # One routing pass for the entire token set.
         expert_indices, expert_weights = self.router.route(
             hidden_states
         )
 
         output = torch.zeros_like(hidden_states)
 
-        # Route once for the full token set, then process the selected experts
-        # in bounded groups. This preserves exact per-token top-2 routing while
-        # preventing all experts touched by the prompt from accumulating in the
-        # GPU working set.
+        # Exact expert working set for this layer. Worst case: all 8 experts.
         unique_expert_ids = sorted(
             int(expert_id)
             for expert_id in expert_indices.reshape(-1).unique().tolist()
         )
 
-        for chunk_start in range(0, len(unique_expert_ids), self.expert_chunk_size):
-            expert_chunk = unique_expert_ids[
-                chunk_start : chunk_start + self.expert_chunk_size
-            ]
+        was_gpu_resident = {
+            expert_id: self.cache_manager.is_gpu_resident(
+                self.layer_id,
+                expert_id,
+            )
+            for expert_id in unique_expert_ids
+        }
 
-            # Experts already resident before this forward are left cached for
-            # reuse. Experts brought in specifically for this chunk are
-            # released afterwards, so completed chunks do not accumulate on GPU.
-            was_gpu_resident = {
-                expert_id: self.cache_manager.is_gpu_resident(
-                    self.layer_id,
-                    expert_id,
+        gpu_experts = {}
+        try:
+            # Ensure every expert needed by this layer is resident before
+            # beginning expert execution. No chunking.
+            for expert_id in unique_expert_ids:
+                gpu_experts[expert_id] = self._ensure_expert_on_gpu(expert_id)
+
+            # Each expert processes all tokens routed to it in one batched
+            # invocation. An expert may appear in either top-k slot.
+            for expert_id in unique_expert_ids:
+                expert = gpu_experts[expert_id]
+                expert_matches = expert_indices == expert_id
+                token_mask = expert_matches.any(dim=-1)
+
+                if not token_mask.any():
+                    continue
+
+                token_weights = (
+                    expert_weights
+                    * expert_matches.to(expert_weights.dtype)
+                ).sum(dim=-1)
+
+                expert_input = hidden_states[token_mask]
+                expert_output = expert(expert_input)
+                weighted_output = (
+                    expert_output
+                    * token_weights[token_mask].unsqueeze(-1)
                 )
-                for expert_id in expert_chunk
-            }
+                output[token_mask] += weighted_output
 
-            try:
-                for expert_id in expert_chunk:
-                    expert = self._ensure_expert_on_gpu(expert_id)
+                del expert_input
+                del expert_output
+                del weighted_output
+                del expert_matches
+                del token_mask
+                del token_weights
 
-                    # A routed expert can appear in either top-k slot. Build a
-                    # single token mask and effective routing weight so each
-                    # expert executes its assigned tokens exactly once.
-                    expert_matches = expert_indices == expert_id
-                    token_mask = expert_matches.any(dim=-1)
-
-                    if not token_mask.any():
-                        del expert
-                        continue
-
-                    token_weights = (
-                        expert_weights * expert_matches.to(expert_weights.dtype)
-                    ).sum(dim=-1)
-
-                    expert_input = hidden_states[token_mask]
-                    expert_output = expert(expert_input)
-                    weighted_output = (
-                        expert_output
-                        * token_weights[token_mask].unsqueeze(-1)
+        finally:
+            # Keep the current cache semantics for this experiment. Experts
+            # that were not resident before this layer are released after use.
+            for expert_id in unique_expert_ids:
+                if not was_gpu_resident[expert_id]:
+                    self.cache_manager.demote_to_cpu(
+                        self.layer_id,
+                        expert_id,
                     )
-
-                    output[token_mask] += weighted_output
-
-                    # Drop temporary references before moving on so completed
-                    # experts can actually release their GPU allocations when
-                    # their cache entry is removed below.
-                    del expert
-                    del expert_input
-                    del expert_output
-                    del weighted_output
-                    del expert_matches
-                    del token_mask
-                    del token_weights
-            finally:
-                for expert_id in expert_chunk:
-                    if not was_gpu_resident[expert_id]:
-                        self.cache_manager.demote_to_cpu(
-                            self.layer_id,
-                            expert_id,
-                        )
+            gpu_experts.clear()
 
         return output
 
