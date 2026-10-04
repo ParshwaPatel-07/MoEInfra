@@ -69,6 +69,10 @@ class ModelLoader:
         self._is_loaded: bool = False
         self._weight_map: dict[str, str] = {}
         self._checkpoint_path: Optional[Path] = None
+        self._preloaded_cpu_experts: dict[
+            tuple[int, int],
+            PrequantizedNF4Expert,
+        ] = {}
     # ------------------------------------------------------------------ #
     # Public API                                                           #
     # ------------------------------------------------------------------ #
@@ -199,6 +203,19 @@ class ModelLoader:
 
         return loaded
 
+    def set_preloaded_cpu_experts(
+    self,
+        experts: dict[tuple[int, int], PrequantizedNF4Expert],
+    ) -> None:
+        """Register permanently resident CPU experts prepared before inference."""
+
+        self._preloaded_cpu_experts = dict(experts)
+
+        self._logger.info(
+            "Registered %d preloaded CPU experts.",
+            len(self._preloaded_cpu_experts),
+        )
+
     def load_embeddings(self) -> torch.Tensor:
         """Load the input token embedding matrix onto CPU."""
 
@@ -302,8 +319,8 @@ class ModelLoader:
         self,
         layer_id: int,
         expert_id: int,
-    ) -> QuantizedMixtralExpert:
-        """Load and NF4-quantize one Mixtral expert."""
+    ) -> PrequantizedNF4Expert | QuantizedMixtralExpert:
+
 
         if not self._is_loaded:
             raise RuntimeError(
@@ -319,6 +336,16 @@ class ModelLoader:
             raise IndexError(
                 f"expert_id {expert_id} out of range [0, {self.num_experts})"
             )
+        # ------------------------------------------------------------
+        # Permanently preloaded CPU tier.
+        # This is checked BEFORE any filesystem access.
+        # ------------------------------------------------------------
+        preloaded = self._preloaded_cpu_experts.get(
+            (layer_id, expert_id)
+        )
+
+        if preloaded is not None:
+            return preloaded
 
         if self._checkpoint_path is None:
             raise RuntimeError("Checkpoint path is not initialized.")
