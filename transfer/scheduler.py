@@ -30,6 +30,7 @@ from transfer.types import (
 from transfer.nf4_transfer import transfer_staged_expert_to_gpu
 from transfer.nf4_reconstruct import ReconstructedNF4Expert
 
+EXECUTE_NEXT_PROFILE: list[dict] = []
 
 class TransferScheduler:
     """Priority-queue scheduler for expert residency transfers."""
@@ -147,8 +148,11 @@ class TransferScheduler:
         self._queue.append(request)
         return True
 
+    
     def execute_next(self) -> Optional[TransferResult]:
-        """Execute the highest-priority pending transfer synchronously."""
+        """Execute the highest-priority pending transfer synchronously,
+        while recording per-stage profiling data.
+        """
         if not self._heap:
             return None
 
@@ -161,23 +165,57 @@ class TransferScheduler:
         error: str | None = None
         success = False
 
+        profile = {
+            "layer_id": request.layer_id,
+            "expert_id": request.expert_id,
+            "direction": request.direction.value,
+        }
+
+        def timed_memory_debug(label: str) -> None:
+            t = time.perf_counter()
+            self._memory_debug(label, request)
+            profile["memory_debug_ms"] = (
+                profile.get("memory_debug_ms", 0.0)
+                + (time.perf_counter() - t) * 1000.0
+            )
+
         try:
+            # -------------------------------------------------
+            # 1. Cache metadata lookup
+            # -------------------------------------------------
+            t = time.perf_counter()
+
             bytes_transferred = self._cache_manager.get_size_bytes(
                 request.layer_id,
                 request.expert_id,
             )
 
+            profile["metadata_lookup_ms"] = (
+                time.perf_counter() - t
+            ) * 1000.0
+
+            # -------------------------------------------------
+            # 2. CPU -> GPU
+            # -------------------------------------------------
             if request.direction == TransferDirection.CPU_TO_GPU:
+
                 if self._staging_pool is None or self._transfer_stream is None:
                     raise RuntimeError(
                         "Synchronous CPU_TO_GPU transfer requires "
                         "staging_pool and transfer_stream"
                     )
 
+                # CPU cache lookup
+                t = time.perf_counter()
+
                 cpu_expert = self._cache_manager.peek_cpu(
                     request.layer_id,
                     request.expert_id,
                 )
+
+                profile["cpu_lookup_ms"] = (
+                    time.perf_counter() - t
+                ) * 1000.0
 
                 if cpu_expert is None:
                     raise RuntimeError(
@@ -186,7 +224,13 @@ class TransferScheduler:
                         f"expert={request.expert_id}"
                     )
 
+                # Staging slot acquisition
+                t = time.perf_counter()
                 slot = self._staging_pool.acquire()
+
+                profile["slot_acquire_ms"] = (
+                    time.perf_counter() - t
+                ) * 1000.0
 
                 if slot is None:
                     raise RuntimeError(
@@ -194,7 +238,12 @@ class TransferScheduler:
                     )
 
                 try:
-                    self._memory_debug("before_stage", request)
+                    timed_memory_debug("before_stage")
+
+                    # -----------------------------------------
+                    # 3. CPU RAM -> pinned staging
+                    # -----------------------------------------
+                    t = time.perf_counter()
 
                     self._staging_pool.stage_expert(
                         slot,
@@ -202,47 +251,103 @@ class TransferScheduler:
                         request.layer_id,
                         request.expert_id,
                     )
-                    self._memory_debug("after_stage", request)
+
+                    profile["staging_ms"] = (
+                        time.perf_counter() - t
+                    ) * 1000.0
+
+                    timed_memory_debug("after_stage")
+
+                    # -----------------------------------------
+                    # 4. Pinned staging -> GPU
+                    # -----------------------------------------
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+
+                    h2d_wall_start = time.perf_counter()
+
+                    start_event.record(self._transfer_stream)
 
                     gpu_state = transfer_staged_expert_to_gpu(
                         slot,
                         self._transfer_stream,
                     )
 
-                    # Synchronous path: wait for the DMA to finish before
-                    # reconstructing the GPU expert.
-                    self._transfer_stream.synchronize()
-                    self._memory_debug("after_h2d", request)
+                    end_event.record(self._transfer_stream)
 
-                    # Important diagnostic boundary: reconstruction currently
-                    # happens BEFORE cache.put() can evict an existing GPU
-                    # expert. This lets us see whether the new expert is being
-                    # allocated while the previous GPU cache is still full.
-                    self._memory_debug("before_reconstruct", request)
+                    # Preserve the existing synchronous behaviour.
+                    self._transfer_stream.synchronize()
+
+                    profile["h2d_wall_ms"] = (
+                        time.perf_counter() - h2d_wall_start
+                    ) * 1000.0
+
+                    profile["h2d_cuda_ms"] = (
+                        start_event.elapsed_time(end_event)
+                    )
+
+                    timed_memory_debug("after_h2d")
+
+                    # -----------------------------------------
+                    # 5. NF4 reconstruction
+                    # -----------------------------------------
+                    timed_memory_debug("before_reconstruct")
+
+                    t = time.perf_counter()
+
                     gpu_expert = ReconstructedNF4Expert(
                         cpu_expert,
                         gpu_state,
                     )
-                    self._memory_debug("after_reconstruct", request)
 
-                    self._memory_debug("before_cache_put", request)
+                    profile["reconstruction_call_ms"] = (
+                        time.perf_counter() - t
+                    ) * 1000.0
+
+                    timed_memory_debug("after_reconstruct")
+
+                    # -----------------------------------------
+                    # 6. GPU cache insertion / possible eviction
+                    # -----------------------------------------
+                    timed_memory_debug("before_cache_put")
+
+                    t = time.perf_counter()
+
                     self._cache_manager.put(
                         request.layer_id,
                         request.expert_id,
                         gpu_expert,
                         device="cuda:0",
                     )
-                    self._memory_debug("after_cache_put", request)
+
+                    profile["cache_put_call_ms"] = (
+                        time.perf_counter() - t
+                    ) * 1000.0
+
+                    timed_memory_debug("after_cache_put")
 
                     success = True
 
                 finally:
+                    # Preserve the original slot lifecycle.
                     self._staging_pool.release(slot)
+
+            # -------------------------------------------------
+            # 7. GPU -> CPU
+            # -------------------------------------------------
             elif request.direction == TransferDirection.GPU_TO_CPU:
+
+                t = time.perf_counter()
+
                 success = self._cache_manager.demote_to_cpu(
                     request.layer_id,
                     request.expert_id,
                 )
+
+                profile["demotion_ms"] = (
+                    time.perf_counter() - t
+                ) * 1000.0
+
             else:
                 raise ValueError(
                     f"Unsupported transfer direction: {request.direction!r}"
@@ -257,13 +362,26 @@ class TransferScheduler:
 
         except Exception as exc:
             error = str(exc)
+
             self._logger.error(
                 "execute_next: FAILED id=%s error=%s",
                 request.request_id,
                 error,
             )
 
+        # -----------------------------------------------------
+        # 8. Final bookkeeping and profiling
+        # -----------------------------------------------------
         elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+        profile["total_execute_next_ms"] = elapsed_ms
+        profile["success"] = success
+        profile["bytes_transferred"] = (
+            bytes_transferred if success else 0
+        )
+
+        EXECUTE_NEXT_PROFILE.append(profile)
+
         self._in_flight.remove(request)
 
         if success:
