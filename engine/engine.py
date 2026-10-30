@@ -145,24 +145,9 @@ class InferenceEngine:
             logger=self._logger,
         )
 
-        staging_budget = PinnedMemoryBudget(
-            budget_bytes=transfer_cfg.get(
-                "staging_budget_mb",
-                512,
-            ) * 1024 * 1024,
-        )
-        self._staging_pool = ReusablePinnedStagingPool(
-            budget=staging_budget,
-            slot_size_bytes=transfer_cfg.get(
-                "staging_slot_mb",
-                128,
-            ) * 1024 * 1024,
-        )
-        self._transfer_stream = (
-            torch.cuda.Stream()
-            if self._device.type == "cuda"
-            else None
-        )
+        # Direct-transfer experiment: no custom staging infrastructure.
+        self._staging_pool = None
+        self._transfer_stream = None
 
         self._transfer_scheduler = TransferScheduler(
             cache_manager=self._cache_manager,
@@ -354,9 +339,8 @@ class InferenceEngine:
 
         causal_mask = create_causal_mask(
             config=self._mixtral_config,
-            input_embeds=hidden_states,
+            inputs_embeds=hidden_states,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=self._kv_cache,
             position_ids=position_ids,
         )
